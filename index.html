@@ -474,10 +474,8 @@ const REPEATS=[['','Does not repeat'],['d1','Daily'],['w1','Weekly'],['w2','Ever
 
 let S={projects:[],tasks:[],templates:[],meetingSeries:[],meetingNotes:[]};
 const GOOGLE_CLIENT_ID='994929569945-shdi5tlk81jvffiua6qpov0fg926h768.apps.googleusercontent.com';
-const GOOGLE_SCOPES='https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/tasks.readonly https://www.googleapis.com/auth/drive.appdata';
-let gToken=null, gStatus='off', gItems=[], gTokenClient=null, gSilentAttempt=false;
-let driveFileId=null, syncState='idle', syncedAt=null, pushTimer=null, pollTimer=null, refreshTimer=null;
-try{ driveFileId=localStorage.getItem('planner.driveFileId')||null; }catch(e){}
+const GOOGLE_SCOPES='https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/tasks.readonly';
+let gToken=null, gStatus='off', gItems=[], gTokenClient=null;
 let theme='light';
 try{ theme = localStorage.getItem('planner.theme') || (matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'); }catch(e){}
 let ctx='work', view='today', projFilter=null, spanBoth=false, query='';
@@ -735,7 +733,7 @@ function classify(text,hasDue){
 /* ══════════════════════════════════════════════════════════
    PERSIST + SEED
    ══════════════════════════════════════════════════════════ */
-const save=()=>{ S.updatedAt=new Date().toISOString(); Store.set(S); queueDrivePush(); };
+const save=()=>Store.set(S);
 function migrate(d){
   d.templates=d.templates||[]; d.projects=d.projects||[];
   d.meetingSeries=d.meetingSeries||[]; d.meetingNotes=d.meetingNotes||[];
@@ -2146,31 +2144,17 @@ function gInit(){
   gTokenClient=google.accounts.oauth2.initTokenClient({
     client_id:GOOGLE_CLIENT_ID, scope:GOOGLE_SCOPES,
     callback:function(resp){
-      const wasSilent=gSilentAttempt; gSilentAttempt=false;
-      if(resp.error){
-        if(wasSilent){gStatus='expired';renderGoogleBox();return} // quiet refresh failed — let the user reconnect when they notice
-        gStatus='error';renderGoogleBox();toast('Google sign-in failed — try again');return;
-      }
+      if(resp.error){gStatus='error';renderGoogleBox();toast('Google sign-in failed — try again');return}
       gToken={access_token:resp.access_token,expires_at:Date.now()+(resp.expires_in*1000)};
-      try{localStorage.setItem('planner.gtoken',JSON.stringify(gToken))}catch(e){}
-      gStatus='on'; scheduleTokenRefresh(); gFetch(); syncOnConnect();
+      try{sessionStorage.setItem('planner.gtoken',JSON.stringify(gToken))}catch(e){}
+      gStatus='on'; gFetch();
     }
   });
   try{
-    const c=JSON.parse(localStorage.getItem('planner.gtoken')||'null');
-    if(c&&c.expires_at>Date.now()+60000){gToken=c;gStatus='on';scheduleTokenRefresh();gFetch();syncOnConnect()}
+    const c=JSON.parse(sessionStorage.getItem('planner.gtoken')||'null');
+    if(c&&c.expires_at>Date.now()+60000){gToken=c;gStatus='on';gFetch()}
   }catch(e){}
   renderGoogleBox();
-}
-function scheduleTokenRefresh(){
-  clearTimeout(refreshTimer);
-  if(!gToken)return;
-  const delay=Math.max(15000, gToken.expires_at-Date.now()-5*60000); // renew ~5min before it expires
-  refreshTimer=setTimeout(function(){
-    if(!gTokenClient)return;
-    gSilentAttempt=true;
-    gTokenClient.requestAccessToken({prompt:''});
-  },delay);
 }
 function gConnect(){
   if(!gTokenClient){toast('Still loading Google sign-in — try again in a second');return}
@@ -2179,14 +2163,12 @@ function gConnect(){
 }
 function gDisconnect(){
   gToken=null; gStatus='off'; gItems=[]; gCalendars=[];
-  try{localStorage.removeItem('planner.gtoken')}catch(e){}
-  stopSync();
+  try{sessionStorage.removeItem('planner.gtoken')}catch(e){}
   renderGoogleBox(); renderListOnly();
 }
 function gExpired(){
   gToken=null; gStatus='expired'; gItems=[];
-  try{localStorage.removeItem('planner.gtoken')}catch(e){}
-  stopSync();
+  try{sessionStorage.removeItem('planner.gtoken')}catch(e){}
   renderGoogleBox(); renderListOnly();
 }
 async function gListCalendars(){
@@ -2268,132 +2250,6 @@ function gPickCalendars(){
       gSaveMap(map); gFetch();
     }});
 }
-/* ══════════════════════════════════════════════════════════
-   SYNC — cross-device sync via a hidden file in the user's own
-   Google Drive (the "appDataFolder", invisible in their normal
-   Drive UI). Piggybacks on the same Google sign-in used above
-   for Calendar/Tasks, so connecting once covers both. Plain
-   last-write-wins by S.updatedAt: a device that has never saved
-   locally (a fresh browser, still on seed data) always defers to
-   whatever is already in Drive instead of overwriting it.
-   ══════════════════════════════════════════════════════════ */
-const DRIVE_FILE_NAME='planner-data.json';
-function driveHeaders(extra){
-  const h={Authorization:'Bearer '+gToken.access_token};
-  return extra?Object.assign(h,extra):h;
-}
-async function driveFindFile(){
-  const res=await fetch('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder'+
-    '&q='+encodeURIComponent("name='"+DRIVE_FILE_NAME+"' and trashed=false")+
-    '&fields=files(id)&pageSize=1',{headers:driveHeaders()});
-  if(res.status===401){gExpired();return null}
-  if(!res.ok)throw new Error('drive list failed ('+res.status+')');
-  const data=await res.json();
-  return (data.files&&data.files[0])||null;
-}
-async function driveDownload(id){
-  const res=await fetch('https://www.googleapis.com/drive/v3/files/'+id+'?alt=media',{headers:driveHeaders()});
-  if(res.status===401){gExpired();return null}
-  if(res.status===404)return null;
-  if(!res.ok)throw new Error('drive download failed ('+res.status+')');
-  return res.json();
-}
-async function driveUpload(existingId,body){
-  const json=JSON.stringify(body);
-  if(existingId){
-    const res=await fetch('https://www.googleapis.com/upload/drive/v3/files/'+existingId+'?uploadType=media',
-      {method:'PATCH',headers:driveHeaders({'Content-Type':'application/json'}),body:json});
-    if(res.status===401){gExpired();return null}
-    if(res.status===404)return driveUpload(null,body); // file was removed out-of-band — recreate it
-    if(!res.ok)throw new Error('drive upload failed ('+res.status+')');
-    return existingId;
-  }
-  const meta={name:DRIVE_FILE_NAME,parents:['appDataFolder']};
-  const boundary='pmp'+Math.random().toString(36).slice(2);
-  const multipart='--'+boundary+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+JSON.stringify(meta)+'\r\n'+
-    '--'+boundary+'\r\nContent-Type: application/json\r\n\r\n'+json+'\r\n--'+boundary+'--';
-  const res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
-    {method:'POST',headers:driveHeaders({'Content-Type':'multipart/related; boundary='+boundary}),body:multipart});
-  if(res.status===401){gExpired();return null}
-  if(!res.ok)throw new Error('drive create failed ('+res.status+')');
-  const data=await res.json();
-  return data.id;
-}
-function rememberDriveFileId(id){
-  driveFileId=id;
-  try{ if(id)localStorage.setItem('planner.driveFileId',id); else localStorage.removeItem('planner.driveFileId'); }catch(e){}
-}
-async function syncPull(){
-  if(!gToken)return;
-  syncState='pulling'; renderGoogleBox();
-  try{
-    const file=driveFileId?{id:driveFileId}:await driveFindFile();
-    if(!gToken)return; // expired mid-request
-    if(!file)return syncPushNow(); // nothing in Drive yet — this device's copy becomes the baseline
-    rememberDriveFileId(file.id);
-    const remote=await driveDownload(file.id);
-    if(!gToken)return;
-    if(remote&&remote.tasks){
-      const remoteTime=remote.updatedAt?Date.parse(remote.updatedAt):0;
-      const localTime=S.updatedAt?Date.parse(S.updatedAt):0;
-      if(remoteTime>localTime){
-        S=migrate(remote); Store.set(S); render();
-        if(localTime)toast('Synced from another device');
-      } else if(localTime>remoteTime){
-        return syncPushNow();
-      }
-    } else {
-      return syncPushNow();
-    }
-    syncedAt=new Date(); syncState='synced'; renderGoogleBox();
-  }catch(err){
-    console.warn('sync pull failed',err); syncState='error'; renderGoogleBox();
-  }
-}
-async function syncPushNow(){
-  if(!gToken)return;
-  clearTimeout(pushTimer);
-  syncState='pushing'; renderGoogleBox();
-  try{
-    const id=await driveUpload(driveFileId,S);
-    if(!gToken)return; // expired mid-request
-    rememberDriveFileId(id);
-    syncedAt=new Date(); syncState='synced'; renderGoogleBox();
-  }catch(err){
-    console.warn('sync push failed',err); syncState='error'; renderGoogleBox();
-  }
-}
-function queueDrivePush(){
-  if(!gToken)return;
-  clearTimeout(pushTimer);
-  pushTimer=setTimeout(syncPushNow,2500);
-}
-function syncOnConnect(){
-  syncPull();
-  clearInterval(pollTimer);
-  pollTimer=setInterval(function(){ if(gToken&&document.visibilityState==='visible')syncPull(); },60000);
-}
-function stopSync(){
-  clearTimeout(pushTimer); clearInterval(pollTimer); clearTimeout(refreshTimer);
-  syncState='idle'; syncedAt=null;
-}
-document.addEventListener('visibilitychange',function(){
-  if(document.visibilityState==='visible'&&gToken&&gStatus==='on')syncPull();
-});
-function relTime(d){
-  const s=Math.round((Date.now()-d.getTime())/1000);
-  if(s<10)return'just now'; if(s<60)return s+'s ago';
-  const m=Math.round(s/60); if(m<60)return m+'m ago';
-  const h=Math.round(m/60); if(h<24)return h+'h ago';
-  return Math.round(h/24)+'d ago';
-}
-function syncLabel(){
-  if(syncState==='pulling')return'Pulling latest&hellip;';
-  if(syncState==='pushing')return'Syncing&hellip;';
-  if(syncState==='error')return'Sync error &mdash; will retry';
-  if(syncedAt)return'Synced '+relTime(syncedAt);
-  return'Not yet synced';
-}
 function renderGoogleBox(){
   const el=document.getElementById('gWrap'); if(!el)return;
   const label={off:'Not connected',connecting:'Connecting&hellip;',syncing:'Syncing&hellip;',
@@ -2401,18 +2257,16 @@ function renderGoogleBox(){
     error:'Connection failed',expired:'Session expired'}[gStatus]||'Not connected';
   el.innerHTML='<span class="eyebrow">Google</span><div class="gbox">'+
     '<div class="grow"><span class="gdot '+(gStatus==='on'?'on':(gStatus==='error'||gStatus==='expired'?'err':''))+'"></span>'+label+'</div>'+
-    (gStatus==='on'?'<div class="sub" style="margin:2px 0 0;font-size:11px">'+syncLabel()+'</div>':'')+
     (gStatus==='on'
       ? '<button class="gbtn" id="gBtn">Refresh &amp; disconnect&hellip;</button>'
-      : '<button class="gbtn" id="gBtn">Connect Google account</button>')+
+      : '<button class="gbtn" id="gBtn">Connect Calendar &amp; Tasks</button>')+
     (gStatus==='on'?'<button class="gbtn" id="gPickBtn" style="margin-top:5px">Choose calendars&hellip;</button>':'')+
     '</div>';
   document.getElementById('gBtn').onclick=function(){
     if(gStatus==='on'){
       sheet({title:'Google account',
-        body:'<p class="sub" style="margin:0">Reads Calendar and Tasks (read-only), and syncs your planner data across your devices via a hidden file in your own Google Drive &mdash; nobody else can see it. '+
-          'Disconnecting only removes access here; nothing changes in Google, and your data stays on this device.</p>',
-        saveLabel:'Sync now', onSave:function(){gFetch(); syncPull()}, onDel:gDisconnect});
+        body:'<p class="sub" style="margin:0">Reading Calendar and Tasks (read-only). Disconnecting only removes access here — nothing changes in Google.</p>',
+        saveLabel:'Refresh now', onSave:function(){gFetch()}, onDel:gDisconnect});
       const s=document.getElementById('sheetScrim');
       const delBtn=s.querySelector('[data-del]'); if(delBtn)delBtn.textContent='Disconnect';
     } else gConnect();
