@@ -417,6 +417,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
       <button style="padding:6px 9px;font-size:11.5px;color:var(--muted);text-align:left;width:100%" id="aiPlanBtn">&#10024; Plan with AI</button>
     </div>
     <div class="sec" id="gWrap"></div>
+    <div class="sec" id="syncWrap"></div>
     <div class="foot">
       <button data-go="meetings">Meetings</button>
       <button data-go="templates">Templates</button>
@@ -440,7 +441,28 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
 <nav class="tabs"><div class="in" id="tabs"></div></nav>
 <div class="toast" id="toast"></div>
 
-<script>
+<script type="module">
+import {initializeApp} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+import {getAuth,GoogleAuthProvider,signInWithPopup,signOut,onAuthStateChanged} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+import {getFirestore,doc,setDoc,onSnapshot} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+
+/* ══════════════════════════════════════════════════════════
+   FIREBASE — backend sync, signed in with the same Google
+   account used for Calendar/Tasks (see SYNC section below).
+   ══════════════════════════════════════════════════════════ */
+const firebaseConfig={
+  apiKey:"AIzaSyBDKhz-OI_Lu4cspdqL0tgV1gV2Onj5U-8",
+  authDomain:"planner-32d58.firebaseapp.com",
+  projectId:"planner-32d58",
+  storageBucket:"planner-32d58.firebasestorage.app",
+  messagingSenderId:"434849018238",
+  appId:"1:434849018238:web:f86411fb512f57d587832f",
+  measurementId:"G-HFVZM73Q2C"
+};
+const fbApp=initializeApp(firebaseConfig);
+const fbAuth=getAuth(fbApp);
+const db=getFirestore(fbApp);
+
 /* ══════════════════════════════════════════════════════════
    STORAGE
    ══════════════════════════════════════════════════════════ */
@@ -476,6 +498,7 @@ let S={projects:[],tasks:[],templates:[],meetingSeries:[],meetingNotes:[]};
 const GOOGLE_CLIENT_ID='994929569945-shdi5tlk81jvffiua6qpov0fg926h768.apps.googleusercontent.com';
 const GOOGLE_SCOPES='https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/tasks.readonly';
 let gToken=null, gStatus='off', gItems=[], gTokenClient=null;
+let fbUser=null, syncState='idle', syncedAt=null, pushTimer=null, unsubDoc=null;
 let theme='light';
 try{ theme = localStorage.getItem('planner.theme') || (matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'); }catch(e){}
 let ctx='work', view='today', projFilter=null, spanBoth=false, query='';
@@ -733,7 +756,7 @@ function classify(text,hasDue){
 /* ══════════════════════════════════════════════════════════
    PERSIST + SEED
    ══════════════════════════════════════════════════════════ */
-const save=()=>Store.set(S);
+const save=()=>{ S.updatedAt=new Date().toISOString(); Store.set(S); queueSyncPush(); };
 function migrate(d){
   d.templates=d.templates||[]; d.projects=d.projects||[];
   d.meetingSeries=d.meetingSeries||[]; d.meetingNotes=d.meetingNotes||[];
@@ -2293,6 +2316,117 @@ function openGoogleItem(id){
   });
 }
 
+/* ══════════════════════════════════════════════════════════
+   SYNC — cross-device sync via Firestore, keyed by the signed-in
+   Google account's uid. Plain last-write-wins by S.updatedAt: a
+   fresh device (still on seed data) always defers to whatever's
+   already stored remotely instead of overwriting it.
+   ══════════════════════════════════════════════════════════ */
+function plannerDoc(){ return doc(db,'planners',fbUser.uid); }
+function applyRemote(remote){
+  const remoteTime=remote&&remote.updatedAt?Date.parse(remote.updatedAt):0;
+  const localTime=S.updatedAt?Date.parse(S.updatedAt):0;
+  if(remoteTime>localTime){
+    S=migrate(remote); Store.set(S); render();
+    if(localTime)toast('Synced from another device');
+    return true;
+  }
+  return false;
+}
+function startSyncListener(){
+  stopSync();
+  syncState='connecting'; renderSyncBox();
+  unsubDoc=onSnapshot(plannerDoc(),function(snap){
+    if(snap.metadata.hasPendingWrites)return; // our own write echoing back
+    if(snap.exists()){
+      const remote=snap.data();
+      const remoteTime=remote.updatedAt?Date.parse(remote.updatedAt):0;
+      const localTime=S.updatedAt?Date.parse(S.updatedAt):0;
+      if(!applyRemote(remote)&&localTime>remoteTime)syncPushNow();
+    } else {
+      syncPushNow(); // nothing remote yet — this device's copy becomes the baseline
+    }
+    syncedAt=new Date(); syncState='synced'; renderSyncBox();
+  },function(err){
+    console.warn('sync listen failed',err); syncState='error'; renderSyncBox();
+  });
+}
+async function syncPushNow(){
+  if(!fbUser)return;
+  clearTimeout(pushTimer);
+  syncState='pushing'; renderSyncBox();
+  try{
+    await setDoc(plannerDoc(),JSON.parse(JSON.stringify(S)));
+    syncedAt=new Date(); syncState='synced'; renderSyncBox();
+  }catch(err){
+    console.warn('sync push failed',err); syncState='error'; renderSyncBox();
+  }
+}
+function queueSyncPush(){
+  if(!fbUser)return;
+  clearTimeout(pushTimer);
+  pushTimer=setTimeout(syncPushNow,2500);
+}
+function stopSync(){
+  if(unsubDoc){unsubDoc(); unsubDoc=null}
+  clearTimeout(pushTimer);
+  syncState='idle'; syncedAt=null;
+}
+async function syncConnect(){
+  syncState='connecting'; renderSyncBox();
+  try{
+    await signInWithPopup(fbAuth,new GoogleAuthProvider());
+  }catch(err){
+    console.warn('sync sign-in failed',err);
+    syncState='error'; renderSyncBox();
+    toast('Google sign-in failed — try again');
+  }
+}
+async function syncDisconnect(){
+  stopSync();
+  try{ await signOut(fbAuth) }catch(e){}
+  fbUser=null; renderSyncBox();
+}
+onAuthStateChanged(fbAuth,function(user){
+  fbUser=user;
+  if(user)startSyncListener(); else stopSync();
+  renderSyncBox();
+});
+function relTime(d){
+  const s=Math.round((Date.now()-d.getTime())/1000);
+  if(s<10)return'just now'; if(s<60)return s+'s ago';
+  const m=Math.round(s/60); if(m<60)return m+'m ago';
+  const h=Math.round(m/60); if(h<24)return h+'h ago';
+  return Math.round(h/24)+'d ago';
+}
+function syncLabel(){
+  if(syncState==='connecting')return'Connecting&hellip;';
+  if(syncState==='pushing')return'Syncing&hellip;';
+  if(syncState==='error')return'Sync error &mdash; will retry';
+  if(syncedAt)return'Synced '+relTime(syncedAt);
+  return'Not yet synced';
+}
+function renderSyncBox(){
+  const el=document.getElementById('syncWrap'); if(!el)return;
+  const on=!!fbUser;
+  const label=on?(fbUser.email||'Connected'):(syncState==='connecting'?'Connecting&hellip;':syncState==='error'?'Connection failed':'Not connected');
+  el.innerHTML='<span class="eyebrow">Sync</span><div class="gbox">'+
+    '<div class="grow"><span class="gdot '+(on?'on':(syncState==='error'?'err':''))+'"></span>'+label+'</div>'+
+    (on?'<div class="sub" style="margin:2px 0 0;font-size:11px">'+syncLabel()+'</div>':'')+
+    '<button class="gbtn" id="syncBtn">'+(on?'Sync &amp; disconnect&hellip;':'Connect Google account')+'</button>'+
+    '</div>';
+  document.getElementById('syncBtn').onclick=function(){
+    if(on){
+      sheet({title:'Sync',
+        body:'<p class="sub" style="margin:0">Keeps your planner data in sync across your devices, tied to your Google account ('+esc(fbUser.email||'')+'). '+
+          'Disconnecting only stops syncing on this device &mdash; your data stays in the cloud and on this device.</p>',
+        saveLabel:'Sync now', onSave:function(){syncPushNow()}, onDel:syncDisconnect});
+      const s=document.getElementById('sheetScrim');
+      const delBtn=s.querySelector('[data-del]'); if(delBtn)delBtn.textContent='Disconnect';
+    } else syncConnect();
+  };
+}
+
 let tto;
 function toast(m){
   const el=document.getElementById('toast');
@@ -2305,6 +2439,7 @@ window.addEventListener('resize',function(){clearTimeout(rz);rz=setTimeout(rende
 load().then(function(){
   render();
   gInit();
+  renderSyncBox();
   if(Store.mode==='memory')toast('Storage unavailable — use Download backup to keep your data');
 });
 </script>
