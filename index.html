@@ -414,6 +414,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
       <span class="eyebrow">Projects</span>
       <div class="proj" id="projList"></div>
       <button style="padding:6px 9px;font-size:11.5px;color:var(--muted);text-align:left;width:100%" id="newProj">+ New project</button>
+      <button style="padding:6px 9px;font-size:11.5px;color:var(--muted);text-align:left;width:100%" id="aiPlanBtn">&#10024; Plan with AI</button>
     </div>
     <div class="sec" id="gWrap"></div>
     <div class="foot">
@@ -1808,6 +1809,118 @@ function nextDue(due,rep){
 }
 
 /* ══════════════════════════════════════════════════════════
+   AI PLANNING
+   ══════════════════════════════════════════════════════════ */
+const AI_KEY_STORAGE='planner.aiKey';
+function getAIKey(){ try{return localStorage.getItem(AI_KEY_STORAGE)||''}catch(e){return ''} }
+function setAIKey(k){ try{ if(k)localStorage.setItem(AI_KEY_STORAGE,k); else localStorage.removeItem(AI_KEY_STORAGE) }catch(e){} }
+const AI_PLAN_SCHEMA={
+  type:'object',
+  properties:{
+    project:{type:'object',properties:{name:{type:'string'}},required:['name'],additionalProperties:false},
+    tasks:{type:'array',items:{type:'object',properties:{
+      title:{type:'string'},
+      notes:{type:'string'},
+      dueInDays:{type:'integer'},
+      priority:{type:'integer',enum:[1,2,3]}
+    },required:['title','notes','dueInDays','priority'],additionalProperties:false}}
+  },
+  required:['project','tasks'],
+  additionalProperties:false
+};
+async function callClaudeForPlan(goal){
+  const key=getAIKey();
+  const res=await fetch('https://api.anthropic.com/v1/messages',{
+    method:'POST',
+    headers:{
+      'content-type':'application/json',
+      'x-api-key':key,
+      'anthropic-version':'2023-06-01',
+      'anthropic-dangerous-direct-browser-access':'true'
+    },
+    body:JSON.stringify({
+      model:'claude-opus-5',
+      max_tokens:4096,
+      output_config:{effort:'medium',format:{type:'json_schema',schema:AI_PLAN_SCHEMA}},
+      messages:[{role:'user',content:
+        'Break the following goal into a project with a short name (max 6 words) and a list of '+
+        '4-10 concrete, actionable tasks. For each task give a short title, one-sentence notes, '+
+        'dueInDays (integer days from today a sensible deadline for that step, 0 if today, in '+
+        'increasing order reflecting a realistic sequence), and priority (1=normal, 2=medium, '+
+        '3=high; use 3 sparingly for true blockers). Goal: '+goal}]
+    })
+  });
+  if(!res.ok){
+    let msg='Request failed ('+res.status+')';
+    try{ const j=await res.json(); if(j&&j.error&&j.error.message)msg=j.error.message }catch(e){}
+    throw new Error(msg);
+  }
+  const data=await res.json();
+  const block=(data.content||[]).filter(b=>b.type==='text')[0];
+  if(!block)throw new Error('No plan returned');
+  return JSON.parse(block.text);
+}
+function openAIPlan(){
+  const savedKey=getAIKey();
+  sheet({title:'Plan with AI',
+    body:
+      (savedKey?'':
+        '<div class="f"><label>Anthropic API key</label><input id="aiKeyIn" type="password" placeholder="sk-ant-...">'+
+        '<p class="sub" style="margin:4px 0 0">Stored only in this browser (localStorage). Get one at '+
+        '<code>console.anthropic.com</code>.</p></div>')+
+      '<div class="f"><label>What do you want to plan?</label>'+
+      '<textarea id="aiGoalIn" rows="3" placeholder="e.g. Launch the Q3 customer report by end of month"></textarea></div>',
+    saveLabel:'Generate plan',
+    onSave:function(el){
+      const keyField=el.querySelector('#aiKeyIn');
+      const key=keyField?keyField.value.trim():savedKey;
+      const goal=el.querySelector('#aiGoalIn').value.trim();
+      if(!goal)return toast('Describe what you want to plan first');
+      if(!key)return toast('Add your Anthropic API key first');
+      setAIKey(key);
+      toast('Planning…');
+      callClaudeForPlan(goal).then(function(plan){
+        openAIPlanReview(plan);
+      }).catch(function(err){
+        toast('AI planning failed: '+err.message);
+      });
+    }});
+}
+function openAIPlanReview(plan){
+  const tasks=(plan.tasks||[]).slice(0,20);
+  sheet({title:'Review AI plan',
+    body:
+      '<div class="f"><label>Project name</label><input id="aiProjName" value="'+esc(plan.project&&plan.project.name||'New project')+'"></div>'+
+      '<div class="f"><label>Tasks &mdash; uncheck any to skip</label>'+
+      '<div style="display:flex;flex-direction:column;gap:6px">'+
+      tasks.map((t,i)=>'<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px">'+
+        '<input type="checkbox" checked data-aitask="'+i+'" style="margin-top:3px">'+
+        '<span><b>'+esc(t.title||'Untitled task')+'</b>'+
+        (t.notes?' &mdash; '+esc(t.notes):'')+
+        ' <span style="color:var(--muted)">('+relDue(iso(addD(today(),+t.dueInDays||0)))+
+        (t.priority>1?', '+(t.priority===3?'High':'Medium'):'')+')</span></span></label>').join('')+
+      '</div></div>',
+    saveLabel:'Add to '+(ctx==='work'?'Professional':'Personal'),
+    onSave:function(el){
+      const name=el.querySelector('#aiProjName').value.trim()||'New project';
+      const t0=today();
+      const pid=uid();
+      S.projects.push({id:pid,name:name,context:ctx,start:iso(t0),end:iso(addD(t0,60)),parentId:null,color:''});
+      let added=0;
+      tasks.forEach(function(t,i){
+        const cb=el.querySelector('[data-aitask="'+i+'"]');
+        if(!cb||!cb.checked)return;
+        const due=iso(addD(t0,+t.dueInDays||0));
+        S.tasks.push(newTask({title:t.title||'Untitled task',notes:t.notes||'',context:ctx,
+          projectId:pid,status:'todo',due:due,priority:Math.min(3,Math.max(1,+t.priority||1)),
+          route:classify(t.title||'',true)}));
+        added++;
+      });
+      save(); render(); toast('Added "'+name+'" with '+added+' task'+(added===1?'':'s'));
+    }});
+}
+
+/* ══════════════════════════════════════════════════════════
    BULK ACTIONS
    ══════════════════════════════════════════════════════════ */
 function togglePick(id){
@@ -1840,6 +1953,7 @@ document.getElementById('newProj').onclick=function(){
   S.projects.push({id:id,name:'New project',context:ctx,start:iso(t),end:iso(addD(t,30)),parentId:null,color:''});
   save(); render(); editProject(id);
 };
+document.getElementById('aiPlanBtn').onclick=function(){openAIPlan()};
 document.getElementById('capBtn').onclick=function(){openCapture()};
 document.getElementById('fab').onclick=function(){openCapture()};
 document.getElementById('paletteBtn').onclick=openPalette;
